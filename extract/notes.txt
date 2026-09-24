@@ -1,0 +1,137 @@
+#  What's AI Orchestration?
+
+- **Definition:** AI orchestration is running model-powered tasks inside a controlled, dependency-aware workflow that decides when the AI runs, what context it receives, how its output is validated, and what happens next.
+- **Chat vs. workflow:** A chat with ChatGPT/Claude is a conversation; a workflow/data pipeline has no human reading each answer and deciding the next step - the system does that automatically.
+- **Key principle:** Airflow controls the workflow; the AI performs bounded, model-powered tasks inside it. The AI does not own the run.
+- **What the AI does *not* decide:** the schedule, what data it receives, or whether its answer is good enough to move forward - the workflow owns all of that.
+- **"Bounded" matters:** unlike an open-ended chatbot, an orchestrated AI task has a narrow, defined job (e.g. classify a ticket, summarize an incident, extract fields) - one task, one responsibility.
+- **You are normally the orchestrator:** in a chat window you bring the context, paste data, judge the answer, and retry if it's wrong. In a pipeline, the system must do all of that reliably on every run, even with no one watching.
+- **Questions orchestration must answer (not about the model, but about control):**
+  - When does the AI step run and what must finish first?
+  - What input does it get, and is that input fresh and correct?
+  - What shape is the output so the next step can use it?
+  - What happens if it fails, returns garbage, times out, or costs too much - and who checks it before damage flows downstream?
+- **Example pipeline:** extract new support tickets → prepare customer context → ask a model to classify each ticket into a fixed schema → validate the schema → route the result to a warehouse table or a human review queue.
+- **"There's machinery behind chat too" rebuttal:** the difference isn't whether machinery exists, it's who closes the loop and when. In chat, you steer; in orchestration, a predefined system makes those decisions.
+- **Engineers are natural orchestrators:** a DAG is already a set of tasks with dependencies, inputs/outputs, retries, timeouts, logs, and quality checks. An AI step is just one more task in that graph.
+- **Trap to avoid:** treating the model like a magic box that figures everything out. Reliable AI workflows do the opposite - give the model a small, well-defined job, control what it sees, and validate what it returns.
+- **Two takeaways:**
+  1. **Definition** - the workflow is in charge; the AI does a narrow job.
+  2. **Mindset** - a DAG (with dependencies, retries, timeouts, logs, quality checks) is the right model for AI work, and an AI step is just one node in that graph.
+
+# Prompt, Chatbot, Assistant, Workflow, or Agent?
+
+- **These terms are not interchangeable.** The distinction isn't marketing - it tells you how much control you have over the design, how much the model decides on its own, and how much damage a bad output can cause.
+
+## The three questions that classify any AI product
+
+- **Control:** who decides what happens next - you, a predefined system, or the model itself?
+- **Autonomy:** how much does the model decide on its own?
+- **Execution boundary:** how far can a run reach - a single call, a conversation, a fixed set of steps, or an open-ended loop?
+
+## The terms, from least to most autonomy
+
+- **Prompt** - one instruction in, one output out. No memory, no tools, no loop (e.g. "summarize this paragraph"). You control everything; the model decides nothing about what's next; boundary is a single call. The atom everything else is built from.
+- **Chatbot** - a multi-turn conversation with memory of the session, but you drive every turn (what to ask, whether to retry). Control stays with the human; autonomy is low; boundary is the conversation (plain Q&A in a chat window).
+- **Assistant** - a chatbot that can also *do things* via tools (e.g. a coding copilot that edits a file, a helpdesk bot that looks up an order). More capable, but still reacting to you turn by turn while you watch. Control is shared; autonomy is moderate; boundary is your supervised session.
+- **Workflow** - the big shift: a predefined system decides what happens next, not a human and not the model. Steps are fixed in advance, it runs unattended, and the AI is just one bounded task inside it. Control moves to the system/orchestrator; the model's autonomy is deliberately low; boundary is a predefined set of steps.
+- **Agent** - you hand the steering wheel to the model. It plans, chooses which tools to call, inspects results, decides the next move, and decides when the loop stops. Control sits with the model; autonomy is very high; boundary is open-ended (limited only by guardrails).
+
+## How to classify a program
+
+- Start with **control - who decides the next step?**
+  - A human in real time -> prompt / chatbot / assistant territory.
+  - It calls tools on your turn -> probably an **assistant**.
+  - A system running predefined steps -> probably a **workflow**.
+  - The model decides its own next move in a loop -> probably an **agent**.
+
+## Worked examples
+
+- **Coding copilot you chat with that reads/edits files when asked:** control is you, autonomy moderate (tools on your turn, under supervision), boundary is your editing session -> **assistant**.
+  - Flip the same product into "agent mode" (plans a multi-step task, edits files, runs tests, reads failures, keeps going until done) and it becomes an **agent**. Same tool and model - what changed is *who decides the next step*.
+- **Pipeline that pulls tickets, asks a model to label each, validates labels, writes to a table, no human present:** control is the system/DAG, autonomy low (model just classifies), boundary is the fixed DAG steps -> **workflow with an AI task inside**. Same model as the copilot, completely different pattern.
+
+## Two common confusions
+
+- **Assistant vs. agent:** both use tools; the difference is *who initiates*. An assistant acts when you prompt it and then waits; an agent keeps going on its own, looping and choosing its next tool until it decides it's done.
+- **Workflow vs. agent:** putting an LLM inside a DAG does **not** make the DAG an agent. If the steps are fixed ahead of time and the model fills one box (one task), it's a deterministic workflow. In a workflow answering tickets, an LLM task categorizes a ticket and predefined downstream paths handle each category. In an agent, those paths are *not* predefined - the agent chooses the path (tool A then B then C, or B then A then C) and you don't know it in advance.
+
+## Takeaway
+
+- In the real world you'll mostly build **workflows that call LLMs in a controlled environment with predefined steps**, rather than agents doing whatever they want (which risks bad production outcomes).
+- To classify any AI product, ask the three questions: control (human / system / model), autonomy (how much the model decides alone), and execution boundary (single call / conversation / fixed steps / open loop).
+
+
+
+# Airflow as the Control Plane for AI
+
+- **The system that "decides what happens next" is Airflow.** It's the control plane for AI workflows: the model may classify, summarize, extract, or reason, but Airflow decides what runs next, what runs before it, what credentials it can use, how outputs move downstream, and what evidence exists when something breaks.
+- **What a control plane / orchestrator is:** the layer that coordinates execution. It doesn't do every piece of work itself, but it decides what runs, in what order, with what configuration, under what limits, and with what record of what happened.
+- **The model is not the control plane and not the DAG.** It's invoked inside a task to do bounded reasoning - receives instruction + context, returns output. It should not schedule itself, build the pipeline, choose unrestricted data access, or decide whether its own output is safe to publish.
+- **Core principle (again):** Airflow controls the workflow; AI performs bounded reasoning tasks inside it.
+
+## Mapping Airflow primitives to AI workflow needs
+
+- **DAG - defines the workflow boundary.** Declares the steps, dependencies, and shape of the run. Prevents the model from *becoming* the workflow: the DAG decides the path, not the model (which is what would happen with a free-running agent). You can still use agents inside a workflow.
+- **Task - a unit of work; where the AI gets its bounded job.** One task classifies, another validates the schema, another writes the accepted result. Each AI task should have **one responsibility** - don't make a single task read everything, decide what matters, update the DB, and notify the customer, or debugging becomes a nightmare.
+- **XComs - make the hand-off between tasks explicit.** Downstream tasks shouldn't parse a paragraph and guess; they should receive a known shape (e.g. label, confidence score, short rationale). XComs are stored in the Airflow metadata DB and are meant for small structured values, not large model-output blobs - use other mechanisms for big data. The contract must be explicit enough for deterministic code to validate and consume.
+- **Retries - controlled re-execution.** Configured at the task level (`retries`, `retry_delay`), not a separate object. Model calls fail for many reasons (rate limits, timeouts, provider errors, network). AI retries are non-trivial: they may cost money, return a different answer, and re-call external services - choose the policy based on cost, variance, and downstream risk.
+- **Durable execution (from the Common AI provider) - for multi-step/agent tasks.** Caches completed model responses and tool results so a retry resumes from the last completed step instead of replaying everything. Essential whenever a task is more than a single LLM call.
+- **Connections - manage access.** Keep credentials for model providers, databases, and internal APIs out of the prompt and out of the code path the model sees.
+- **Logs - the record of execution.** When an AI task behaves strangely, task logs tell you what happened.
+- **Human-in-the-loop operators - the approval step.** Prevent bad AI output from reaching customers. A human can approve, reject, modify, or request changes before the workflow continues. This is a real workflow task, not a polite instruction in the prompt - Airflow can pause, wait for the decision, then continue on the approved path.
+- **Waitable DAG API endpoint - controls external execution boundaries (Airflow 3.1+).** Lets an external app trigger a DAG and wait synchronously for a terminal state and selected task results, instead of firing-and-polling. Airflow still owns the DAG run; the caller just gets a synchronous integration point. Useful for AI inference-style use cases.
+
+## Worked example: customer support reply workflow
+
+- **Flow:** fetch open tickets -> collect customer context -> AI task drafts a reply -> validate the draft -> wait for human approval -> send the response.
+- **AI task:** drafts a reply from ticket text, account context, and policy guidance. It does not decide the whole process or choose unrestricted customer data; it returns a draft plus structured metadata.
+- **XCom (structured):** downstream receives fields like ticket ID, draft reply, needs-human-review flag, rationale.
+- **Retry policy:** ~2 retries (more attempts cost money and vary); set durable execution to `true` if the AI task is a multi-call agent, so retries don't replay completed LLM work.
+- **Human-in-the-loop:** the most important step - a human approves/rejects/edits/requests changes before anything customer-facing is sent.
+- **Waitable DAG API:** if an external product (e.g. a sales/support console) requests a reply draft on demand, it can trigger the DAG and wait for the approved result.
+
+
+# When to Use AI (and When to Stay Deterministic)
+
+- **Not every task should be an AI task.** AI is powerful in data workflows but is not a replacement for code, SQL constraints, tests, or business rules. The skill is knowing where a model adds value, where it doesn't, and where the answer should stay deterministic.
+- **AI is probabilistic:** the same prompt asked twice can give different outputs.
+
+## The core rule
+
+- **Use AI** when the task depends on interpreting messy, ambiguous, or language-heavy input - and the result is still something code can check.
+- **Use deterministic code** when the task depends on known rules, exact computation, system-of-record data, permissions, or repeatable transformations. If you already know the steps and their order, there's no point using AI to figure them out.
+- **Combine both (the common case):** AI helps with interpretation; deterministic logic makes the final decisions. Interpretation -> AI; correctness/repeatability/authority -> keep the workflow in charge.
+
+## Good AI fits
+
+- **Classification from unstructured text** - support tickets, sales notes, incident reports, reviews, etc. The model assigns a label from a fixed set; output can be constrained (category, confidence score, short rationale), definable via a Pydantic model.
+- **Data extraction from documents** - invoices, contracts, emails. The model turns messy unstructured content into structured fields; deterministic tasks then validate types, required fields, ranges, and cross-checks (e.g. invoice number, vendor, amount, due date).
+- **Summarization** - compact views of large input (failed pipeline runs, batches of feedback, long threads) for human consumption or triage. A summary aids understanding but should not replace the underlying logs, metrics, or records.
+
+## Keep these deterministic
+
+- **Calculations** - revenue, balances, rates, counts, averages, SLAs. Need repeatability and auditability.
+- **Joins, filters, transformations** - e.g. join orders to customers, drop invalid records, convert timestamps. The rules are known.
+- **Validation** - if an AI task returns JSON, a label, a date, or a score, don't ask a second prompt "does this look valid?" Use deterministic schema checks, type checks, allowed-value checks.
+
+## The split pattern (most real workflows)
+
+- Workflow prepares context -> AI performs a bounded interpretation -> deterministic tasks validate the output and decide what happens next.
+- **Example (detect cancellation intent from emails):**
+  - *Weak design:* one AI task reads the email and cancels the account if needed. Unreliable.
+  - *Stronger design:* fetch new emails -> strip records the model shouldn't see -> AI classifies intent into fixed labels (cancel / billing question / technical issue / other) -> validate the label is allowed -> route high-confidence cancels to a retention queue -> a human controls any actual account change.
+  - The model interprets the language; the workflow controls the action.
+
+## Quick quiz
+
+- **Classify support tickets into five known categories** -> Good AI fit (interpretation, bounded output).
+- **Calculate monthly recurring revenue from subscription records** -> No, deterministic (source data + finance rules).
+- **Extract renewal dates from contract PDFs** -> Good AI fit (extraction from documents, with deterministic checks).
+- **Decide whether a row passes a not-null test** -> No, deterministic (a known validation rule, nothing to interpret).
+
+## Summary
+
+- Use AI for messy language/documents, matching, summarization, classification, extraction - especially when output can be bounded and validated.
+- Use deterministic code for calculations, joins, filters, schema/quality checks, permissions - anything where correctness and repeatability matter.
+- In practice you'll usually do both: AI interprets, then deterministic code validates, routes, gates, and acts on what the AI produced.
