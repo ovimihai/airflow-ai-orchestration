@@ -1,0 +1,1151 @@
+
+
+<!-- ===== 00.summary.md ===== -->
+
+#### Lesson 1: What Is AI Orchestration?
+
+- AI orchestration is running model-powered tasks inside a controlled, dependency-aware workflow that decides when the AI runs, what context it receives, how outputs are validated, and what happens next
+- Airflow controls the workflow; the AI performs bounded tasks inside it (one task, one responsibility)
+- In a chat window, you are the orchestrator: you bring context, judge answers, and retry. In a pipeline, the system must do all of that automatically, every run, with nobody watching
+- Data engineers already have the right mindset: an AI step is just another task in a DAG, with dependencies, retries, timeouts, logs, and quality checks
+- Avoid the "magic box" trap: give the model a small, well-defined job, control what it sees, and validate what it returns
+
+#### Lesson 2: Prompt, Chatbot, Assistant, Workflow, Agent
+
+- Three questions classify any AI system: **control** (who decides the next step), **autonomy** (how much the model decides on its own), and **execution boundary** (how far one run reaches)
+- **Prompt**: one instruction in, one output out. No memory, no tools, no loop
+- **Chatbot**: multi-turn conversation with memory, but you still drive every turn
+- **Assistant**: a chatbot that can also call tools and take actions, still reacting to you under your supervision
+- **Workflow**: a predefined system decides what happens next; the AI is one bounded task inside fixed steps
+- **Agent**: the model plans, picks tools, evaluates results, and decides when to stop; the highest level of autonomy
+- Putting an LLM inside a DAG does not make it an agent. In production, you will mostly build workflows that call LLMs in a controlled environment
+
+#### Lesson 3: Mapping Airflow to AI Workflows
+
+- Airflow is the control plane: it decides what runs, in what order, with what configuration and limits, and keeps a record of what happened. The model only performs bounded reasoning inside a task
+- The **DAG** defines the workflow boundary and prevents the model from becoming the workflow; each **task** gives the AI one narrow responsibility
+- **XComs** make hand-offs between tasks explicit: pass small, structured values (label, confidence, rationale) that downstream code can validate, not raw paragraphs
+- **Retries** handle transient model failures (rate limits, timeouts), but each attempt costs money and may return a different answer, so choose the policy deliberately
+- **Durable Execution** (Common AI provider) caches completed model and tool calls so a retry of a multi-step agent task resumes from the last completed step instead of replaying everything
+- **Connections** keep credentials out of prompts and code; **logs** create the record of execution for debugging
+- **Human-in-the-loop operators** make approval a real workflow step: Airflow pauses, waits for a human to approve, reject, or edit, then continues
+- The **waitable DAG run API endpoint** (Airflow 3.1+) lets an external application trigger a DAG and wait synchronously for the result
+
+#### Lesson 4: When to Use AI (and When Not To)
+
+- AI is probabilistic: the same prompt can return different outputs. Use it when the task requires interpreting messy, ambiguous, or language-heavy input and the result can still be checked by code
+- Good AI fits: classification into a fixed set of labels, extraction of structured fields from documents, and summarization for human consumption
+- Keep deterministic: calculations and metrics, joins/filters/transformations, and anything involving permissions or credentials, where correctness and repeatability matter
+- Validation should be deterministic: check AI outputs with schema checks, allowed values, and type checks, never with a second "does this look valid?" prompt
+- The **split pattern** is what you will use most: the workflow prepares context, AI performs a bounded interpretation, deterministic code validates and routes the output, and a human gates any critical action
+
+<!-- ===== 01.ai-orchestration.md ===== -->
+
+#  What's AI Orchestration?
+
+- **Definition:** AI orchestration is running model-powered tasks inside a controlled, dependency-aware workflow that decides when the AI runs, what context it receives, how its output is validated, and what happens next.
+- **Chat vs. workflow:** A chat with ChatGPT/Claude is a conversation; a workflow/data pipeline has no human reading each answer and deciding the next step - the system does that automatically.
+- **Key principle:** Airflow controls the workflow; the AI performs bounded, model-powered tasks inside it. The AI does not own the run.
+- **What the AI does *not* decide:** the schedule, what data it receives, or whether its answer is good enough to move forward - the workflow owns all of that.
+- **"Bounded" matters:** unlike an open-ended chatbot, an orchestrated AI task has a narrow, defined job (e.g. classify a ticket, summarize an incident, extract fields) - one task, one responsibility.
+- **You are normally the orchestrator:** in a chat window you bring the context, paste data, judge the answer, and retry if it's wrong. In a pipeline, the system must do all of that reliably on every run, even with no one watching.
+- **Questions orchestration must answer (not about the model, but about control):**
+  - When does the AI step run and what must finish first?
+  - What input does it get, and is that input fresh and correct?
+  - What shape is the output so the next step can use it?
+  - What happens if it fails, returns garbage, times out, or costs too much - and who checks it before damage flows downstream?
+- **Example pipeline:** extract new support tickets → prepare customer context → ask a model to classify each ticket into a fixed schema → validate the schema → route the result to a warehouse table or a human review queue.
+- **"There's machinery behind chat too" rebuttal:** the difference isn't whether machinery exists, it's who closes the loop and when. In chat, you steer; in orchestration, a predefined system makes those decisions.
+- **Engineers are natural orchestrators:** a DAG is already a set of tasks with dependencies, inputs/outputs, retries, timeouts, logs, and quality checks. An AI step is just one more task in that graph.
+- **Trap to avoid:** treating the model like a magic box that figures everything out. Reliable AI workflows do the opposite - give the model a small, well-defined job, control what it sees, and validate what it returns.
+- **Two takeaways:**
+  1. **Definition** - the workflow is in charge; the AI does a narrow job.
+  2. **Mindset** - a DAG (with dependencies, retries, timeouts, logs, quality checks) is the right model for AI work, and an AI step is just one node in that graph.
+
+
+<!-- ===== 02.prompt-or-agent.md ===== -->
+
+# Prompt, Chatbot, Assistant, Workflow, or Agent?
+
+- **These terms are not interchangeable.** The distinction isn't marketing - it tells you how much control you have over the design, how much the model decides on its own, and how much damage a bad output can cause.
+
+## The three questions that classify any AI product
+
+- **Control:** who decides what happens next - you, a predefined system, or the model itself?
+- **Autonomy:** how much does the model decide on its own?
+- **Execution boundary:** how far can a run reach - a single call, a conversation, a fixed set of steps, or an open-ended loop?
+
+## The terms, from least to most autonomy
+
+- **Prompt** - one instruction in, one output out. No memory, no tools, no loop (e.g. "summarize this paragraph"). You control everything; the model decides nothing about what's next; boundary is a single call. The atom everything else is built from.
+- **Chatbot** - a multi-turn conversation with memory of the session, but you drive every turn (what to ask, whether to retry). Control stays with the human; autonomy is low; boundary is the conversation (plain Q&A in a chat window).
+- **Assistant** - a chatbot that can also *do things* via tools (e.g. a coding copilot that edits a file, a helpdesk bot that looks up an order). More capable, but still reacting to you turn by turn while you watch. Control is shared; autonomy is moderate; boundary is your supervised session.
+- **Workflow** - the big shift: a predefined system decides what happens next, not a human and not the model. Steps are fixed in advance, it runs unattended, and the AI is just one bounded task inside it. Control moves to the system/orchestrator; the model's autonomy is deliberately low; boundary is a predefined set of steps.
+- **Agent** - you hand the steering wheel to the model. It plans, chooses which tools to call, inspects results, decides the next move, and decides when the loop stops. Control sits with the model; autonomy is very high; boundary is open-ended (limited only by guardrails).
+
+## How to classify a program
+
+- Start with **control - who decides the next step?**
+  - A human in real time -> prompt / chatbot / assistant territory.
+  - It calls tools on your turn -> probably an **assistant**.
+  - A system running predefined steps -> probably a **workflow**.
+  - The model decides its own next move in a loop -> probably an **agent**.
+
+## Worked examples
+
+- **Coding copilot you chat with that reads/edits files when asked:** control is you, autonomy moderate (tools on your turn, under supervision), boundary is your editing session -> **assistant**.
+  - Flip the same product into "agent mode" (plans a multi-step task, edits files, runs tests, reads failures, keeps going until done) and it becomes an **agent**. Same tool and model - what changed is *who decides the next step*.
+- **Pipeline that pulls tickets, asks a model to label each, validates labels, writes to a table, no human present:** control is the system/DAG, autonomy low (model just classifies), boundary is the fixed DAG steps -> **workflow with an AI task inside**. Same model as the copilot, completely different pattern.
+
+## Two common confusions
+
+- **Assistant vs. agent:** both use tools; the difference is *who initiates*. An assistant acts when you prompt it and then waits; an agent keeps going on its own, looping and choosing its next tool until it decides it's done.
+- **Workflow vs. agent:** putting an LLM inside a DAG does **not** make the DAG an agent. If the steps are fixed ahead of time and the model fills one box (one task), it's a deterministic workflow. In a workflow answering tickets, an LLM task categorizes a ticket and predefined downstream paths handle each category. In an agent, those paths are *not* predefined - the agent chooses the path (tool A then B then C, or B then A then C) and you don't know it in advance.
+
+## Takeaway
+
+- In the real world you'll mostly build **workflows that call LLMs in a controlled environment with predefined steps**, rather than agents doing whatever they want (which risks bad production outcomes).
+- To classify any AI product, ask the three questions: control (human / system / model), autonomy (how much the model decides alone), and execution boundary (single call / conversation / fixed steps / open loop).
+
+
+<!-- ===== 03.control-plane-for-ai.md ===== -->
+
+# Airflow as the Control Plane for AI
+
+- **The system that "decides what happens next" is Airflow.** It's the control plane for AI workflows: the model may classify, summarize, extract, or reason, but Airflow decides what runs next, what runs before it, what credentials it can use, how outputs move downstream, and what evidence exists when something breaks.
+- **What a control plane / orchestrator is:** the layer that coordinates execution. It doesn't do every piece of work itself, but it decides what runs, in what order, with what configuration, under what limits, and with what record of what happened.
+- **The model is not the control plane and not the DAG.** It's invoked inside a task to do bounded reasoning - receives instruction + context, returns output. It should not schedule itself, build the pipeline, choose unrestricted data access, or decide whether its own output is safe to publish.
+- **Core principle (again):** Airflow controls the workflow; AI performs bounded reasoning tasks inside it.
+
+## Mapping Airflow primitives to AI workflow needs
+
+- **DAG - defines the workflow boundary.** Declares the steps, dependencies, and shape of the run. Prevents the model from *becoming* the workflow: the DAG decides the path, not the model (which is what would happen with a free-running agent). You can still use agents inside a workflow.
+- **Task - a unit of work; where the AI gets its bounded job.** One task classifies, another validates the schema, another writes the accepted result. Each AI task should have **one responsibility** - don't make a single task read everything, decide what matters, update the DB, and notify the customer, or debugging becomes a nightmare.
+- **XComs - make the hand-off between tasks explicit.** Downstream tasks shouldn't parse a paragraph and guess; they should receive a known shape (e.g. label, confidence score, short rationale). XComs are stored in the Airflow metadata DB and are meant for small structured values, not large model-output blobs - use other mechanisms for big data. The contract must be explicit enough for deterministic code to validate and consume.
+- **Retries - controlled re-execution.** Configured at the task level (`retries`, `retry_delay`), not a separate object. Model calls fail for many reasons (rate limits, timeouts, provider errors, network). AI retries are non-trivial: they may cost money, return a different answer, and re-call external services - choose the policy based on cost, variance, and downstream risk.
+- **Durable execution (from the Common AI provider) - for multi-step/agent tasks.** Caches completed model responses and tool results so a retry resumes from the last completed step instead of replaying everything. Essential whenever a task is more than a single LLM call.
+- **Connections - manage access.** Keep credentials for model providers, databases, and internal APIs out of the prompt and out of the code path the model sees.
+- **Logs - the record of execution.** When an AI task behaves strangely, task logs tell you what happened.
+- **Human-in-the-loop operators - the approval step.** Prevent bad AI output from reaching customers. A human can approve, reject, modify, or request changes before the workflow continues. This is a real workflow task, not a polite instruction in the prompt - Airflow can pause, wait for the decision, then continue on the approved path.
+- **Waitable DAG API endpoint - controls external execution boundaries (Airflow 3.1+).** Lets an external app trigger a DAG and wait synchronously for a terminal state and selected task results, instead of firing-and-polling. Airflow still owns the DAG run; the caller just gets a synchronous integration point. Useful for AI inference-style use cases.
+
+## Worked example: customer support reply workflow
+
+- **Flow:** fetch open tickets -> collect customer context -> AI task drafts a reply -> validate the draft -> wait for human approval -> send the response.
+- **AI task:** drafts a reply from ticket text, account context, and policy guidance. It does not decide the whole process or choose unrestricted customer data; it returns a draft plus structured metadata.
+- **XCom (structured):** downstream receives fields like ticket ID, draft reply, needs-human-review flag, rationale.
+- **Retry policy:** ~2 retries (more attempts cost money and vary); set durable execution to `true` if the AI task is a multi-call agent, so retries don't replay completed LLM work.
+- **Human-in-the-loop:** the most important step - a human approves/rejects/edits/requests changes before anything customer-facing is sent.
+- **Waitable DAG API:** if an external product (e.g. a sales/support console) requests a reply draft on demand, it can trigger the DAG and wait for the approved result.
+
+
+<!-- ===== 04.when-to-use-ai.md ===== -->
+
+# When to Use AI (and When to Stay Deterministic)
+
+- **Not every task should be an AI task.** AI is powerful in data workflows but is not a replacement for code, SQL constraints, tests, or business rules. The skill is knowing where a model adds value, where it doesn't, and where the answer should stay deterministic.
+- **AI is probabilistic:** the same prompt asked twice can give different outputs.
+
+## The core rule
+
+- **Use AI** when the task depends on interpreting messy, ambiguous, or language-heavy input - and the result is still something code can check.
+- **Use deterministic code** when the task depends on known rules, exact computation, system-of-record data, permissions, or repeatable transformations. If you already know the steps and their order, there's no point using AI to figure them out.
+- **Combine both (the common case):** AI helps with interpretation; deterministic logic makes the final decisions. Interpretation -> AI; correctness/repeatability/authority -> keep the workflow in charge.
+
+## Good AI fits
+
+- **Classification from unstructured text** - support tickets, sales notes, incident reports, reviews, etc. The model assigns a label from a fixed set; output can be constrained (category, confidence score, short rationale), definable via a Pydantic model.
+- **Data extraction from documents** - invoices, contracts, emails. The model turns messy unstructured content into structured fields; deterministic tasks then validate types, required fields, ranges, and cross-checks (e.g. invoice number, vendor, amount, due date).
+- **Summarization** - compact views of large input (failed pipeline runs, batches of feedback, long threads) for human consumption or triage. A summary aids understanding but should not replace the underlying logs, metrics, or records.
+
+## Keep these deterministic
+
+- **Calculations** - revenue, balances, rates, counts, averages, SLAs. Need repeatability and auditability.
+- **Joins, filters, transformations** - e.g. join orders to customers, drop invalid records, convert timestamps. The rules are known.
+- **Validation** - if an AI task returns JSON, a label, a date, or a score, don't ask a second prompt "does this look valid?" Use deterministic schema checks, type checks, allowed-value checks.
+
+## The split pattern (most real workflows)
+
+- Workflow prepares context -> AI performs a bounded interpretation -> deterministic tasks validate the output and decide what happens next.
+- **Example (detect cancellation intent from emails):**
+  - *Weak design:* one AI task reads the email and cancels the account if needed. Unreliable.
+  - *Stronger design:* fetch new emails -> strip records the model shouldn't see -> AI classifies intent into fixed labels (cancel / billing question / technical issue / other) -> validate the label is allowed -> route high-confidence cancels to a retention queue -> a human controls any actual account change.
+  - The model interprets the language; the workflow controls the action.
+
+## Quick quiz
+
+- **Classify support tickets into five known categories** -> Good AI fit (interpretation, bounded output).
+- **Calculate monthly recurring revenue from subscription records** -> No, deterministic (source data + finance rules).
+- **Extract renewal dates from contract PDFs** -> Good AI fit (extraction from documents, with deterministic checks).
+- **Decide whether a row passes a not-null test** -> No, deterministic (a known validation rule, nothing to interpret).
+
+## Summary
+
+- Use AI for messy language/documents, matching, summarization, classification, extraction - especially when output can be bounded and validated.
+- Use deterministic code for calculations, joins, filters, schema/quality checks, permissions - anything where correctness and repeatability matter.
+- In practice you'll usually do both: AI interprets, then deterministic code validates, routes, gates, and acts on what the AI produced.
+
+
+<!-- ===== 10.about.md ===== -->
+
+### About this module
+
+**Welcome! We're so glad you're here 😍**
+
+  
+
+In [Module 1](https://academy.astronomer.io/ai-orchestation-introduction-for-data-engineers), you learned that Airflow controls the workflow, and AI performs bounded tasks inside it. In this module, you put that rule to work by designing your first AI-aware Dag, step by step.
+
+  
+
+Everything is built around one realistic example: a SaaS company receives customer emails, and some are cancellation requests. Every hour, a pipeline collects new emails, identifies the intent with AI, extracts the requested cancellation date, checks the account, and routes each case to the right team. You'll turn that business process into a Dag with clear tasks, dependencies, and a clean split between deterministic steps and AI steps.
+
+  
+
+You'll then zoom in on the parts that make or break an AI workflow. The XCom contract: what the AI task returns, which fields are required, and what the next task does when the contract is not met. The branching task: the model returns a business label, and your code (not the model) maps that label to the next task. The retry policy: for AI tasks, a retry can cost money and return a different answer, so you'll set retries based on cost, variance, and risk.
+
+  
+
+By the end, you'll have a complete design for an AI-aware Dag: the tasks, the dependencies, the data passed between them, and the rules that keep the workflow in control.
+
+**🎯Objectives**
+
+At the end of this module, you'll be able to:
+
+  
+
+- Turn a business process into an AI-aware Dag sketch with tasks, dependencies, and the data shared between them
+
+- Decide which tasks need AI and which should stay deterministic
+
+- Design an XCom contract for an AI task: required fields, allowed values, what stays out of XCom, and what happens when the contract is not met
+
+- Design a branching task that routes on validated AI output, keeping the label-to-task mapping in your code
+
+- Set a retry policy for an AI task based on cost, variance, and risk, including timeouts and what to do when no usable output comes back
+
+  
+
+👥 **Audience**
+
+  
+
+Who should take this course:
+
+  
+
+- Data engineers who want to add AI capabilities to their pipelines
+
+- Analytics engineers working with unstructured or language-heavy data
+
+- Data platform engineers responsible for reliable workflow orchestration
+
+- Airflow users curious about AI workflows but unsure where to start
+
+- Anyone who needs a rigorous framework for deciding where AI belongs in a data workflow
+
+  
+
+Set aside 30 minutes to complete the module.
+
+  
+
+💻 **Setup Requirements**
+
+  
+
+You need to have the following:
+
+  
+
+- Module 1 of this course (it builds the mental model this module stands on)
+
+- Basic understanding of Apache Airflow Dags, tasks, and dependencies
+
+- General awareness of LLMs (having used an AI chat tool is enough)
+
+- No coding environment required, as this module is design-focused
+
+<!-- ===== 11.wellcome.md ===== -->
+
+## Welcome
+
+#### What You'll Learn
+
+How to turn a business process into an AI-aware DAG: the tasks, the data passed between them, the branching, and the retries.
+
+  
+
+**The Problem**
+
+  
+
+Your manager describes a process in one sentence. Turning it into a DAG that runs reliably is where mistakes happen:
+
+  
+
+- Giving the AI task a vague job with no defined output
+
+- Letting the model decide which task runs next
+
+- Retrying AI tasks like any other task, ignoring cost and changing answers
+
+  
+
+**The Solution**
+
+  
+
+Design before you build. Fix the tasks, the contracts, the routes, and the retry rules up front.
+
+  
+
+Before: "AI, read the customer email and handle the cancellation"
+
+  
+
+After: Fetch Emails → Classify Intent (AI) → Validate Contract → Check Account → Route Case
+
+  
+
+The model returns a label.
+
+Your code decides what runs next.
+
+  
+
+#### Module Structure
+
+1. From Business Process to AI-Aware DAG
+
+2. The XCom Contract for AI Tasks
+
+3. Branching on AI Output
+
+4. Retry Policies for AI Tasks
+
+#### Keep in Mind
+
+- Sketch tasks and dependencies before writing any code
+
+- Every AI task needs a contract: known fields, allowed values
+
+- The model returns a label; your code maps it to the next task
+
+- An AI retry costs money and may return a different answer
+
+  
+
+**Ready? Let's begin!**
+
+  
+
+💡 Pro Tip: Pick one real process from your company (like handling support emails) and sketch it as a DAG while you follow the lessons.
+
+<!-- ===== 12.start.md ===== -->
+
+# Turning a Business Process into an AI-Aware DAG
+
+- **The core skill:** translate a business process ("when a customer emails about cancellation, figure out what they want, check their account, route the case, update the right systems") into a runnable Airflow DAG.
+- **End goal of the lesson:** a sketch of an AI-aware DAG with tasks, dependencies, which tasks are deterministic vs. AI, and the data shared between tasks.
+
+## Example scenario
+
+- A SaaS company receives customer emails in a shared inbox: some are cancellations, some billing questions, some support issues, some unrelated.
+- Every hour: collect new emails, identify intent, extract any requested cancellation date, check account status, and route the case.
+  - Clear cancellation from an active customer -> retention queue
+  - Billing question -> billing
+  - Support issue -> support
+  - Unclear request, or account status doesn't match -> manual review
+- **Key constraint:** no customer account is changed automatically, but AI is still used for interpretation.
+
+## The four steps
+
+1. **Find the verbs** in the requirement - they're candidate tasks (collect emails, identify intent, extract cancellation date, check account status, route case, avoid automatic account changes). Verbs are only *candidates*; some are too broad, some deterministic, some aren't tasks at all (e.g. "avoid automatic account changes" is a design constraint, not a task).
+2. **Classify each candidate** as deterministic, AI, system-of-record, or constraint:
+   - Collect emails -> deterministic (email API/hook)
+   - Normalize & store raw email records -> deterministic (email ID, received-at, sender, etc.)
+   - Identify customer intent -> AI (natural language in, fixed labels out: cancellation, billing, technical support, other)
+   - Extract requested cancellation date -> AI-assisted (messy language like "end of the month"), but the value must be checked deterministically
+   - Check account status -> deterministic (system of record)
+   - Validate the AI output -> deterministic (LLM-as-judge is a separate topic)
+   - Route the case -> deterministic (branch on validated fields; model classifies, the DAG owns the branch set)
+3. **Draw the DAG** (task boundaries + dependencies): fetch new emails -> normalize email records -> classify intent (AI, bounded) -> validate intent output -> fetch customer account status (only after validation, to avoid wasted lookups) -> route case (deterministic; combines validated AI output + account status into a finite set of branches).
+4. **Describe the shared data** between tasks. E.g. normalize -> classify passes email ID, sender, subject, body text. Classify -> validate passes email ID, intent, requested cancellation date, confidence, rationale. Always include a **confidence score and rationale** so you understand why the LLM chose an answer.
+
+## Common mistakes to avoid
+
+- **One giant AI task** (e.g. "handle cancellation email AI") that hides too much - split it into smaller tasks that are easier to debug and monitor.
+- **Using AI for system-of-record facts** - the model can classify the email, but a deterministic SQL query should decide whether an account is active.
+- **Hidden branching inside the prompt** - keep branching deterministic; once you know the intent (e.g. "cancellation"), you already know the next task, so don't let AI pick it.
+
+
+<!-- ===== 13.design-xcom.md ===== -->
+
+# Designing the XCom Contract Between AI and Deterministic Tasks
+
+- **Why it matters:** the hand-off from an AI task to the next task is where things go wrong if you just return whatever the model produced. Zoom in on what gets passed between tasks.
+- **Setup:** the cancellation email workflow - an AI task classifies the email, then a deterministic task validates that output before any routing.
+
+## The problem with free-text output
+
+- A human-readable blob like "the customer seems to want cancellation before renewal, I'll send this to retention" is a poor task boundary.
+- The downstream validation task can't reliably interpret it - the model might phrase it differently ("cancel", "churn risk", "wants to leave"), include two routes, etc.
+- Downstream tasks should consume **structured fields**, not prose.
+
+## Producer and consumer
+
+- **Producer:** `classify intent AI` (bounded) - reads prepared email content, returns a classification result.
+- **Consumer:** `validate intent output` (deterministic) - checks whether the AI returned the fields the workflow expects, without re-reading the email or re-parsing prose.
+- What the consumer needs: record identity, an intent label, whether a cancellation date was found, the confidence, and a short human-inspectable reason (the rationale).
+
+## The XCom payload
+
+- `email ID` - ties output back to the source record
+- `intent` - from a fixed set (cancellation, billing, technical support, ...)
+- `requested cancellation date` - ISO date if present, else null
+- `confidence` - a number in a known range (usually 0-1, e.g. 0.91)
+- `needs review` - a simple flag for uncertain/ambiguous cases
+- `rationale` - short explanation; helps understand the decision and is great for debugging
+
+## What NOT to put in an XCom
+
+- XComs are size-limited (stored in the metadata DB) - don't pass gigabytes.
+- For large/original content (PDFs, big reports), pass a **reference** (e.g. `body ref`) instead of the content itself.
+
+## Consumer behavior (validation)
+
+- The contract is incomplete until you define what the consumer does. `validate intent output` checks:
+  - email ID is present
+  - intent is one of the allowed labels
+  - confidence is a number in the expected range
+  - requested cancellation date is null or a valid ISO date
+  - rationale is a non-null string
+- Once valid, `route case` uses only the accepted fields (deterministic rules): e.g. cancellation + needs_review false -> retention queue; billing + no review -> billing; technical support -> support queue; needs review or intent "other" -> manual review.
+- `route case` never reads the original email or asks the model what to do - it applies deterministic rules to a validated XCom.
+
+## When the contract is not met
+
+- If intent is missing/invalid, confidence is out of range, the date is invalid, or required identifiers are missing - decide what to do: raise an exception (stop the workflow + notify), or fail `validate intent output` and run a downstream task that only runs on that failure.
+- Always plan for what happens when things go wrong.
+
+## Summary - five things to write down for an XCom contract
+
+1. The producer task and the consumer task.
+2. The required fields and their allowed values.
+3. Which fields are for deterministic logic vs. only for human inspection.
+4. What stays out of the XCom (too large/sensitive, or better passed by reference).
+5. What happens when the payload does not match the contract.
+
+
+<!-- ===== 14.branching.md ===== -->
+
+# Branching on AI Output (Correctly)
+
+- **Tempting but wrong:** asking the model to classify an email *and* say which Airflow task should run next (e.g. reply "send to retention queue"). That hands the model control over the execution path, which the DAG should own.
+- Risk: how do you guarantee the model returns a real, executable task instead of something crazy?
+
+## What NOT to do
+
+- Ask the model to return a task name/ID as free text and feed that string straight into the branch (e.g. "classify this email and tell me which downstream task to run").
+- This breaks in several ways:
+  - The branch set becomes whatever the model says - it may invent a nonexistent task, misspell a task ID, return two routes, or return a whole sentence.
+  - The DAG no longer documents its own path - you'd have to inspect the prompt and model behavior, not just the DAG.
+  - Task IDs get coupled to prompt text - rename a task and you must update the prompt, or the model sticks to the old name.
+
+## The fix
+
+- Have the model produce a **label from a fixed set**, then use **deterministic code** to map that label to an existing task ID. The mapping lives in code you own and test, not in the prompt.
+- Create the downstream tasks the branch routes to: cancellation -> `send to retention queue`, billing -> `send to billing queue`, technical support -> `send to support queue`.
+- The model says *what the email is* (e.g. cancellation); it does not say *which task to run*.
+
+## Branch task logic
+
+- Input is `validated` (from `validate intent output`) - the structured, already-checked payload.
+- If `needs review` is true (model unsure) -> run `send to manual review`.
+- Otherwise return the task ID matching the intent (e.g. billing -> `send to billing queue`).
+- Use `.get()` to read the validated intent: if it's misspelled or unexpected, fall back to the manual-review route rather than risk a customer-impacting task. Always keep a safety fallback.
+
+## The LLM branch operator (alternative)
+
+- The Common AI provider offers an `LLMBranchOperator` that discovers downstream task IDs automatically from the DAG and **constrains** the model to choose only from that set - so it can never pick a nonexistent task. Less code, very reliable. Recommended, though the native mapping approach is worth understanding.
+
+## Wiring
+
+- Define dependencies between the branch task and its downstream tasks, and the branch correctly routes AI output to the right task.
+
+## Summary - four rules for branching on AI output
+
+1. Branch on **validated** output, not raw model text.
+2. List the routes as a **fixed set the DAG owns** - the model can't add to it or invent tasks.
+3. Make the set **exhaustive** - every input, including ones that don't fit, lands on a real branch, usually a fallback to manual review.
+4. Keep the mapping **deterministic** - the model produces a label; your code maps the label to a task ID.
+
+
+<!-- ===== 15.retry-policy.md ===== -->
+
+# Retry Policy for AI Tasks
+
+- **Why retries matter:** tasks fail for many reasons (dropped DB connection, a 503, a file not ready yet), and Airflow can retry automatically.
+- **AI adds complexity:** a retry may spend more tokens, take a different amount of time, or return a slightly different answer. For AI tasks, the retry policy is a decision about **cost, variance, and risk**, not just availability.
+- **Running example:** the cancellation email workflow, focused on `classify intent AI` - input is a prepared email record, output is a compact XCom (email ID, intent, requested cancellation date, confidence, rationale). It's clean but non-deterministic: the model can be slow, hit a rate limit, return malformed output, or produce a different label/confidence/rationale on retry.
+
+## Four factors for defining a retry policy
+
+1. **Cost per call** - short-text classification is cheap; long-context document analysis is expensive. Every retry spends real money and consumes rate-limit capacity.
+2. **Output variance** - how much can the same prompt's answer change between runs?
+3. **Provider limits** - how many calls can you safely make at once, and what happens when many mapped tasks retry together? (This is where pools, retry backoff, and max retry delay matter - don't rely on generic task settings.)
+4. **Downstream impact** - a wrong retried output routed to manual review is fine; a wrong customer-facing message is not.
+
+## Is the task a good retry candidate?
+
+- **Retry:** technical errors (provider issues, network timeouts, worker interruption); invalid JSON output (retry at least once).
+- **Don't retry:** low-confidence answers (the first answer may be the best; retrying just to get a different one risks sending something wrong) - unless you changed the context. Also don't retry missing required input or business/validation failures; fix the code instead.
+
+## Implementing the policy (example for `classify intent AI`)
+
+- `retries = 1` - one normal attempt plus at most one retry.
+- `execution_timeout` = 3 minutes per attempt.
+- `retry_delay` = 1 minute (wait at least a minute).
+- `retry_exponential_backoff` = true - each retry waits longer.
+- `max_retry_delay` = 10 minutes - never wait more than that.
+- Assign the task to an **AI provider pool** to prevent a retry storm against the model provider when many DAGs fail at once. A pool limits concurrency via slots (e.g. 2 slots = at most 2 tasks in parallel), which protects cost and rate limits.
+
+## Idempotency
+
+- **Definition:** running a task twice for the same input gives the same output. For deterministic tasks it means no duplicate writes; for AI tasks it means not creating two different decisions that both affect downstream systems.
+- **Single AI call pattern:** key the result by stable input identity + prompt version, e.g. an idempotency key of `model ID + prompt version + model name + normalized input hash`. If a result already exists for that key, the retry reuses the stored result instead of making a second model call.
+
+## Durable execution (multi-step / agent tasks)
+
+- New concept from the Airflow Common AI provider, for a single task that contains a reasoning loop (model call -> tool call -> model call -> ...).
+- Without it, a failure on step 5 makes a normal retry start over from step 0.
+- With `durable = true`, completed model responses and tool results are cached during the failed attempt, so on retry Airflow replays the cache and resumes from the failure point.
+- Requires a compatible operator (e.g. the agent operator from the Common AI provider) and a configured cache path (set in the Airflow config; can be local or e.g. a bucket).
+- The cache survives failed attempts within the same DAG; once the task instance succeeds, its cached results are cleaned up.
+
+## Recap
+
+- Evaluate four things when choosing retries/timeouts for an AI task: cost per call, output variance, provider limits, downstream impact.
+- Then choose the policy: retry temporary failures, cap each attempt with a timeout, use backoff and pools to protect capacity, validate outputs deterministically, and use an idempotency key or durable execution when repeated attempts could repeat expensive work.
+
+
+<!-- ===== 21.single_llm_call.md ===== -->
+
+# A Single LLM Call
+
+- A **single-turn LLM call** = hand the model one prompt, get one answer. In Airflow this is done with the `@task.llm` decorator from the Common AI provider.
+- **Running example:** a workflow that processes incoming customer emails - prepare each email, classify the customer's intent, then validate the model output before any further action.
+  - `normalize email records` - deterministic; cleans/normalizes the email.
+  - `classify intent AI` - the single-turn model call; takes the normalized output and classifies the email with AI.
+  - `validate intent output` - deterministic; checks the model output before anything downstream acts on it.
+
+## Step 1 - Prepare the input
+
+- **Don't** pass whatever the source system gives (full email thread, headers, attachments). A common mistake.
+- **Do** clean and structure the input first - a structured input gives better answers.
+- For this example, pass only what the model needs: **email ID, sender, subject, body text**.
+- Call `.strip()` on the body text to normalize whitespace. You can do more field processing, but keep it simple here.
+
+## Step 2 - Write the single-turn LLM task
+
+- Use the `@task.llm` decorator - it turns a Python function into an LLM-backed Airflow task.
+- Important: the function does **not** call the model directly - it **builds the prompt** for this task instance.
+- Key arguments:
+  - **`llm_connection_id`** (e.g. `pydantic_ai_default`) - tells Airflow which model provider connection to use. Pass the model you want; put your token in the connection's **password field**.
+  - **`system_prompt`** - tells the LLM how to behave; this is where the task definition goes (e.g. "classify the email, return a compact JSON object, use this label set, and do not choose an Airflow task or queue").
+  - **Function parameter** (e.g. `email_record`) - comes from the upstream task output (`normalize email records`).
+  - **Function body** - returns the prompt string (email ID, sender, subject, body text). That returned string is the runtime context passed to the LLM.
+- **Output type caveat:** with no `output_type` set, the task returns a **string**. Not recommended. Define `output_type` with a Pydantic model so you know exactly what the LLM produces. Don't let the LLM return a plain string unless you explicitly want one.
+
+## Step 3 - Wire it into the DAG
+
+- Full flow: `fetch new email` (returns a fake email) -> `normalize email record` (extracts only the wanted fields) -> `classify intent AI` -> `validate intent output` (always check what the LLM produces before going further).
+- The example is intentionally simple: we don't choose the model or specify the output type yet - those come later in the module.
+
+## Common mistakes to avoid (exam-relevant)
+
+- **Passing too much input** - give the model only what it needs; prepare the fields first, or you get poor outputs.
+- **Putting provider details or secrets in the prompt** - use an Airflow connection instead (store connection details/token there).
+- **Reaching for an agent by default** - a single LLM call is enough for simple classification; you don't need an agent.
+- **Treating model text as validated data** - until you use `output_type` or parse the response yourself, the output is just a string. Always validate before acting.
+
+## Key takeaways
+
+- The LLM decorator is the simplest way to call a model in Airflow and covers a lot of real work.
+- Clean the input, define behavior in the system prompt, build the prompt in the function body, and validate the output downstream.
+- Prefer a typed `output_type` (Pydantic) over a raw string whenever possible.
+
+
+<!-- ===== 22.choose-a-model.md ===== -->
+
+# Choose a Model
+
+- Being able to call an LLM with the decorator isn't enough - the next question is **which model to pick, and why**. The answer should not be "the biggest," "the smallest," or "the cheapest." Use a deliberate method.
+- **Running example:** the `classify intent AI` task, classifying each email into one of four labels - cancellation, billing, technical support, other.
+
+## Step 1 - Gather facts about the task
+
+- Write down the task's characteristics, e.g.:
+  - Task: classify customer email intent
+  - Daily volume: ~20,000 emails
+  - Average input: ~600 tokens; large input: ~2,500 tokens
+  - Expected output: small object
+  - Latency target: classify each email within 5 minutes
+  - Retry policy: 1 retry
+  - Provider limit: 300 requests/minute
+  - Quality requirement: high precision for cancellation; some cases go to review
+- Why each fact matters:
+  - **Daily volume** -> whether a small cost difference matters
+  - **Input size** -> whether the model can even handle the task correctly
+  - **Latency target** -> whether a slower model creates backlog
+  - **Retry policy** -> the worst-case number of calls
+
+## Step 2 - Account for attempts, not just records
+
+- Budget for retries: 20,000 emails/day with 1 retry = 20,000 normal calls, but up to ~40,000 in the worst case (network/provider issues).
+- Estimate token volume:
+  - tokens per attempt = input tokens + output tokens
+  - daily token volume = records x tokens per attempt
+  - retry-adjusted volume accounts for the extra attempts
+- This tells you spend: a 10x-more-expensive model over 20,000 records/day is a big cost difference.
+
+## Step 3 - Pick a model tier (examples, not permanent recommendations)
+
+- **Fast / low-cost** - good starting point for short, bounded tasks (classification, summaries): e.g. Claude Haiku 4.5, GPT-5 Nano.
+- **Balanced** - more ambiguity, longer context, higher quality: e.g. Claude Sonnet 4.6, GPT-5 Mini.
+- **High-capability / long-context** - large input or harder reasoning: e.g. GPT-5.2, Opus 4.8.
+- Models change often (roughly monthly/quarterly), so treat these as examples.
+- **For the email classifier:** start with a fast/low-cost model (short input, fixed label set, small output) - e.g. Claude Haiku 4.5.
+
+## Step 4 - Specify the model (two ways)
+
+- **In the Airflow connection** - set the model in the connection's `extra` field (visible in the Airflow UI).
+- **In code** - set the `model_id` parameter on the LLM decorator (provider + model).
+- Use whichever pattern your platform standardizes on. The key goal is **visibility** - you should be able to tell which model the decorator uses without digging through obscure code.
+
+## Common mistakes to avoid (exam-relevant)
+
+- **Choosing the biggest model by default** - works, but wastes money; use data to find the right fit.
+- **Choosing the cheapest model by default** - if quality is too low, downstream review breaks.
+- **Sizing only for average input** - account for occasional long threads/logs, not just the average email.
+- **Ignoring retries and provider limits** - the retry policy can turn 20,000 calls into 40,000, which may change your model choice.
+
+## Key takeaway
+
+- Choosing a model is a data-driven decision: gather task facts, budget for retries/tokens/cost, match to a model tier, specify it visibly, and avoid the "biggest/cheapest by default" traps.
+
+
+<!-- ===== 23.system-prompt-vs-prompt.md ===== -->
+
+# System Prompt vs Prompt
+
+- **System prompt:** instructions that stay the same every run - the task goal, allowed labels, output routes. Defines **how the model behaves**.
+- **Prompt:** what the decorator function returns; changes each run because it depends on the inputs. Tells the model **what to do for this specific instance**.
+- **The mistake:** mixing the system prompt and the prompt together, which makes the task harder to review and debug. Remember whatever the LLM decorator returns is the prompt - so if you jam everything into the returned string, it all becomes "the prompt."
+- **Also version both** the system prompt and the prompt, or debugging ("which run used which prompt?") becomes very hard.
+
+## Step 1 - Write the system prompt
+
+- Specify: the **task goal** (e.g. "classify customer support emails for an Airflow DAG"), the **allowed labels**, the **expected output shape**, and the **rules**.
+- Usually you do **not** specify the output in the system prompt - use the `output_type` parameter with a Pydantic class instead (kept simple here).
+- Include a **prompt version** at the top (name + version). This is metadata for logs/tests, not part of the model prompt, and you maintain it by hand.
+- Keep the system prompt in its own file that you import wherever needed.
+
+## Step 2 - Build the runtime prompt
+
+- Create a function (e.g. `build_email_runtime_prompt`) that takes the email record and builds the context: email ID, sender, subject, body text - everything the model needs for the task defined in the system prompt.
+- Use `json.dumps` to encode newlines and special characters. The function returns the prompt to pass to the model.
+
+## Step 3 - Wire it to the LLM decorator
+
+- Pass the imported `system_prompt`, and call `build_email_runtime_prompt` to produce the per-run prompt from the email record.
+- At run time the model takes **both** the system prompt and the prompt, and returns a structured output as specified.
+
+## Make the prompt version useful
+
+- Attach the prompt version to the model output - e.g. a `tag_with_prompt_version` task that takes the model output and email record and returns `{ email_id, prompt_version, raw_response }`.
+- This is valuable for debugging a bad classification later: read the row and know exactly which prompt version ran. Saves time in production.
+
+## Your responsibility (exam-relevant)
+
+- **Bump the prompt version** whenever you change the prompt - changed labels, removed something, changed guardrails/rules, etc.
+
+## Key takeaway
+
+- Keep the **stable** instructions (behavior, what to check, how strict) in the system prompt, and the **changing** per-run content in the returned prompt. Version both, and attach the version to the output for traceability. (Next: the proper way to specify the model output - not in the system prompt.)
+
+
+<!-- ===== 24.model_output.md ===== -->
+
+# Model Output
+
+- Once the prompt is clean, the next step is to make sure the **output** is correct by defining the output type.
+- By default the LLM decorator returns a **string**. Even if it looks like JSON, Airflow doesn't know if it's valid - you'd still have to check downstream.
+- **Better:** pass a Pydantic model to the `output_type` parameter. Then you no longer need a downstream task to check the output - if the LLM produces something that doesn't match the model (invalid types or labels, etc.), **the task fails right away**.
+
+## What the downstream task needs
+
+- For email classification, the consumer needs: original email ID, intent label, confidence score, short rationale, and the requested cancellation date (only if the email asks to cancel).
+- With a Pydantic model it just receives the typed object - no re-parsing to check fields.
+
+## Defining the Pydantic model
+
+- A class (e.g. `SupportIntentOutput`) inheriting from `BaseModel`, with:
+  - `email_id`, `intent`, `confidence`, `rationale` - **required**.
+  - `requested_cancellation_date` - **optional** (`| None`), since not every email is a cancellation request.
+  - `intent` as a **`Literal`** of allowed values (cancellation, billing, technical support, other) - not an arbitrary string. Include an "other" value for when the model is unsure.
+  - `confidence` constrained between 0 and 1 via `Field`.
+  - `rationale` as a string.
+
+## Cleaner prompt
+
+- With the output model defined, **remove the output field descriptions from the prompt** - they belong in the Pydantic model, which is more reliable.
+- The prompt still tells the model **what to do** (classify, guidance on picking the right intent, rules like "use a low confidence score when ambiguous" and "do not choose an Airflow task/queue/route"), but the **output structure lives in the Pydantic model**.
+
+## Wiring it up
+
+- Pass the model to the decorator's `output_type` parameter (e.g. `output_type=SupportIntentOutput`). That connects the model response to the workflow contract.
+- The provider returns a Pydantic instance, which the Airflow provider serializes - downstream you receive a **dictionary** with the fields.
+- Example consumer (`choose_handling_policy`): takes the classification (now a dict) and routes - e.g. confidence < 0.7 or intent "other" -> `needs review`; intent cancellation -> `retention queue`; otherwise -> `support queue`.
+
+## Common mistakes to avoid (exam-relevant)
+
+- **Using a string for labels** - use `Literal` for fixed value sets, and include an "other" fallback so the model picks "other" rather than something risky in production.
+- **Thinking structure = correctness** - the structure is guaranteed, but you still must verify the **content**: which label was chosen, whether it makes sense, whether the confidence is high enough to proceed.
+
+## Key takeaway
+
+- Define the output shape with a Pydantic `output_type` (use `Literal` for labels, constrain numeric fields, mark optionals). This makes the output reliable by construction - but you still validate the *values*, not just the shape.
+
+
+<!-- ===== 25.model-settings.md ===== -->
+
+# Model Settings (agent_params)
+
+- So far the LLM task has a connection, a system prompt, and a typed output - enough to run, but it says nothing about *how* the model behaves at run time: how creative it is, how long to wait before giving up, and who retries (and how many times).
+- That's the job of the **`agent_params`** parameter.
+
+## What agent_params is
+
+- Under the hood the LLM decorator builds an Agent and runs it. `agent_params` is a **dictionary handed straight to that agent** - whatever options the agent supports, you set them here.
+- The two most common keys:
+  - **`model_settings`** - controls the model call itself.
+  - **retry options** - control what happens when a single call goes wrong.
+- Everything else (connection, system prompt, output type) stays on the decorator; `agent_params` is for fine-tuning.
+
+## Model settings
+
+- Depend heavily on the model - check your model's API for available settings. For classification:
+  - **`temperature`** - how much the model improvises. For classification you want the same email to land on the same label, so set it to **0** (or close).
+  - **`max_tokens`** - caps answer length. Output is a small structured object, so keep it tight to reduce cost and latency.
+  - **`timeout`** - patience for a **single model call** (seconds), e.g. 30s, so a hanging provider doesn't block forever.
+- These apply to **one** model call and concern the quality/speed of the answer.
+
+## Two kinds of retries (use both)
+
+- **Agent retries** - via `output_retries` in `agent_params` (e.g. `output_retries=2`). If the model answers but the result doesn't fit the Pydantic output (invented label, confidence as text, etc.), the agent sends the error back to the model and asks it to try again - **all inside the same task run**, no delay, not even visible in the Airflow UI. Handles a **bad answer** (the call worked, the content was wrong).
+- **Airflow retries** - via `retries` on the decorator (e.g. `retries=2`). If the provider returns a 500, the connection drops, or you hit a rate limit, the **task fails**; Airflow waits (e.g. 30s) and retries. Handles a **broken call** (infrastructure failure).
+
+## Putting it together
+
+- The same classifier, plus:
+  - Airflow-level: `retries=2`, `retry_delay=30s`, `execution_timeout=2 min`.
+  - `agent_params`: `model_settings` (temperature, max_tokens, timeout 30s) and `output_retries=2`.
+- **Two timeouts:** the `model_settings` timeout is for one model call (30s); `execution_timeout` is for the whole task (2 min). The per-call timeout must always be **smaller** than the task-level timeout.
+
+## Common mistakes to avoid (exam-relevant)
+
+- **Leaving temperature high** for a classification task - turn it down so the same input gives the same label. High temperature is for drafting, not deciding.
+- **Model-call timeout longer than the task timeout** - the inner one must be smaller.
+- **Mixing up the two retries** - bad output -> `output_retries`; failing API -> Airflow `retries`.
+- **Cranking agent retries up to paper over a broken prompt** - if the output never validates, retrying forever just costs more. Fix the prompt or the output type instead.
+
+## Key takeaway
+
+- `agent_params` fine-tunes the model call (`model_settings`) and the agent-level retry of invalid output (`output_retries`). Pair it with Airflow's own `retries` for infrastructure failures - the two retry types are complementary, and both matter.
+
+
+<!-- ===== 31.do-you-need-an-agent.md ===== -->
+
+# From @task.llm to @task.agent (Do You Need an Agent?)
+
+- A **single-turn LLM task** (`@task.llm`) does one thing: one prompt in, one answer out. Great when you already know everything the model needs and can fit it in the prompt.
+- You need an **agent** (`@task.agent`) when the model must find information or work through multiple steps - e.g. "look at the warehouse and explain yesterday's revenue drop," where you don't know which tables matter until you start looking.
+- Main message: **most of the time you do NOT need an agent.** Start with the LLM decorator - it's more useful than people think.
+
+## When the LLM decorator is enough
+
+- A single-turn task assumes everything the model needs is already in front of it - in the prompt or passed by an upstream task.
+- Example: to classify an email that needs the customer's account status, have an **upstream task fetch the status deterministically** and feed it in, rather than letting the model fetch it.
+- This pattern (prefetch the data, feed it in) covers a huge amount of real work and is **cheaper, simpler, and faster**.
+- An agent *could* do it too, but it would be slower and more expensive - the question isn't "could an agent?" but "do I actually need one?"
+
+## Two signals you need an agent
+
+1. **The model must decide what to look up**, and you can't script it in advance (e.g. list tables -> pick one -> run a query -> look again).
+2. **The work is a multi-step loop** - look, think, act, look again. Whenever there's a loop, you need an agent.
+
+## Code difference
+
+- LLM decorator: `@task.llm(...)` with a connection ID + system prompt; the function returns the prompt.
+- Agent decorator: swap `@task.llm` for `@task.agent`. The key addition is **toolsets** (an agent usually needs tools).
+- At run time the agent loops: model -> tool -> model -> tool ... until done, all **inside one Airflow task**.
+
+## Agent decorator parameters
+
+- **`toolsets`** - the big one: the list of things the agent is allowed to do (query a database, an S3 bucket, etc.). Without tools an agent isn't very useful.
+- **`enable_tool_logging`** - turns each tool call into a log line (which tool ran, args, result). Almost always turn this on for agents - otherwise the reasoning loop is a black box and hard to debug.
+- **`output_type`** - defines the output shape (usually a Pydantic model) so downstream tasks get a known structure. Important to set.
+- **`agent_params`** - fine-tuning (model settings, how many times it retries bad responses, etc.).
+- **`durable`** - caches each completed step and replays instantly on retry, so if the agent dies on step 7, a retry resumes near where it left off instead of re-paying for steps 1-6. Turn it on, especially with many tool calls.
+
+## Traps to avoid (exam-relevant)
+
+- **Using an agent when prefetch + `@task.llm` would do** - if you know what data is needed, fetch it deterministically and stay single-turn. Agents cost more and are harder to debug.
+- **Running an agent with tool logging off** - you want visibility into the reasoning loop.
+- **Letting an agent return free text** - give it an `output_type` so the output shape is guaranteed.
+- **A long, expensive agent with no `durable` and no retries** - set `durable=true` for multi-step agents so a failure doesn't restart everything from scratch.
+
+
+<!-- ===== 32.toolsets.md ===== -->
+
+# Toolsets
+
+- **Problem:** if you give an agent a raw database connection and let it run any SQL, one bad reasoning step could read too many tables or even drop tables. You need to constrain what the agent can do.
+- **Solution:** a **toolset** lets you precisely define what your agent is allowed to do.
+
+## Tool vs toolset
+
+- **Tool** - one named thing the agent can do. It has a name, a short description of when to use it, a defined set of arguments, and does exactly one thing (e.g. `get_schema` -> returns columns and types for a table, arg: table name).
+- **Toolset** - a bundle of related tools. Passing a toolset to an agent means "here is the exact named list of things you're allowed to do."
+
+## Toolsets from the Common AI provider
+
+- **SQL toolset** - database tools (list tables, read schema, etc.).
+- **Hook toolset** - turns the methods of an existing Airflow hook into tools (very popular).
+- **MCP toolset** - connects the agent to tools served by an MCP server.
+
+## SQL toolset
+
+- Instantiate `SQLToolset` from `toolsets.sql`. Key parameters:
+  - **`db_connection_id`** - the Airflow connection to the database (e.g. `warehouse_postgres`).
+  - **allowed tables** - which tables the agent may access (e.g. orders, customers).
+  - **`max_rows`** - how many rows the agent can pull back.
+- Behind the scenes it exposes four named tools (at least for now):
+  - **`list_tables`** - list the table names it's allowed to see
+  - **`get_schema`** - columns/types for a single table
+  - **`query`** - run a SQL query
+  - **`check_query`** - validate SQL syntax without running it
+
+## Hook toolset (preview)
+
+- Airflow has a hook for nearly every service (HTTP hook, S3 hook, etc.), each exposing methods your tasks use. The hook toolset turns those methods into agent tools.
+- Example (S3): import the hook toolset and the `S3Hook`, instantiate it with the hook + its connection (`aws_conn_id` -> `aws_default`), list the **allowed methods** (e.g. `list_keys`, `read_key`, `check_for_key`), and optionally set a `tool_name_prefix` (e.g. `s3_`) so the agent knows which tools belong to it.
+
+## Using a toolset with the agent decorator
+
+- `@task.agent` with `llm_connection_id`, a `system_prompt` (e.g. "you are the analyst, use the tools to investigate the orders data and explain the revenue drop"), and a **list of toolsets** (here just the SQL toolset with its connection, allowed tables, `max_rows`).
+- **Enable tool logging** so you can see the reasoning loop: you'll observe the tool calls in order, e.g. `list_tables` -> `get_schema` -> `query`.
+
+## Key takeaway
+
+- Toolsets are how you give an agent capabilities **safely and explicitly** - a named, bounded list of tools rather than open-ended access. Enable tool logging to keep the loop debuggable.
+
+
+<!-- ===== 33.hook-toolset.md ===== -->
+
+# Hook Toolset
+
+- **Goal:** turn an Airflow hook you already trust into agent tools. Example: use the SFTP operator/hook so the agent can look around a partner's server - list files, check timestamps, see if a file landed.
+- A **hook** is an abstraction between a service and your Airflow operator. Airflow has many hooks (S3, SFTP, HTTP, ...), and you can expose their methods as agent tools.
+
+## Using the hook toolset
+
+- Import `HookToolset` (from the Common AI provider toolsets) and the hook you want. Parameters:
+  - **hook** - the hook to use (e.g. `SFTPHook`).
+  - **connection** - the connection the hook expects (e.g. `ssh_conn_id` -> `partner_sftp`).
+  - **`allowed_methods`** - list of hook methods to turn into tools (e.g. `list_directory`, `path_exists`, `get_mod_time`). **Required** - there is no "expose everything" / auto-discovery mode.
+  - **`tool_name_prefix`** (optional) - e.g. `sftp_`, so tools become `sftp_list_directory`, `sftp_path_exists`, etc.
+
+## Important: no read-only mode
+
+- Unlike the SQL toolset (which has a `read_only`/write flag defaulting to false), the hook toolset has **no such protection**. It doesn't know which methods read and which destroy - it builds a tool for each name you give, runs the method, and returns the result.
+- So if you put `delete_directory` in `allowed_methods`, the agent gets a working delete tool with **no second layer of protection**. Choosing the correct methods is **your responsibility**.
+- Example (SFTP hook):
+  - Safe to expose (read-only): `list_directory`, `path_exists`, `get_mod_time`, `describe_directory`.
+  - Dangerous (take action/write): `store_file`, `create_directory`, `delete_file`, `delete_directory`.
+
+## HTTP hook special case
+
+- The HTTP hook calls an external API/endpoint and really has one useful method: **`run`**. But `run` could read or write depending on the HTTP method.
+- You decide read vs write **in the hook itself**: pass the `method` parameter (default POST; set to `GET` to be sure the tool won't write). Also define the connection (`http_conn_id`), `allowed_methods`, and a prefix.
+- **Lesson:** sometimes you control read/write via `allowed_methods`, and sometimes you must set it in the hook's initialization (like HTTP's `method`).
+
+## Documentation matters
+
+- The agent picks a tool based on the method's **name, description, and parameters**. Poorly documented methods (meaningless param names, lookalike methods doing different things) make it hard for the agent to choose correctly. When picking a hook, verify its documentation makes sense.
+
+## Putting it together
+
+- `@task.agent` with `llm_connection_id`, a `system_prompt`, and a toolsets list containing the hook toolset (e.g. SFTP hook, connection `partner_sftp`, allowed methods `list_directory` / `path_exists` / `get_mod_time`, prefix `sftp_`). Turn on `enable_tool_logging`. The decorated function just returns the prompt.
+
+## Key takeaway
+
+- The hook toolset is very powerful (Airflow has hundreds of hooks = hundreds of potential tools), but it has **no built-in read-only guard** - you must choose safe methods yourself, and for some hooks (HTTP) set read/write at init time.
+
+
+<!-- ===== 34.mcp-toolset.md ===== -->
+
+# MCP Toolset
+
+- With the SQL and hook toolsets, **you** decide exactly what the agent can do. But sometimes the tool already exists - someone built a service exposed over a standard protocol (weather service, code sandbox, etc.) and you just want to use it.
+- That's what the **MCP toolset** is for.
+
+## What is MCP
+
+- **MCP = Model Context Protocol** - a standard way for programs to expose tools to AI models.
+- Contrast with the hook toolset: there you adapt a specific hook's methods into tools, but it's bespoke - every new system needs its own wiring.
+- MCP flips this: the system exposes its tools **once** as an MCP server speaking the standard protocol, and **any** MCP-aware client (your agent, a chat app, an IDE) can connect, discover the tools, and learn how to call them. **One protocol, many clients.**
+- An **MCP server** is just a process that says, in the standard language, "here are the tools I offer, here's what each does, call them like this" - the same name/capability/arguments idea as other toolsets.
+
+## Using the MCP toolset
+
+- `@task.agent` with `llm_connection_id` and a `system_prompt`; in the toolsets list, pass the **MCP toolset**:
+  - **`mcp_connection_id`** - points to an Airflow connection of type **mcp** holding the server's URL and any credentials. Address and secrets live in the connection / secret backend, **not** in the DAG code.
+  - **`tool_prefix`** - namespaces the tool names. Important for MCP: two MCP servers can expose tools with the same name (e.g. both have `get_forecast`), causing a collision. Prefixing (e.g. `weather_`) avoids it.
+
+## Key difference: you don't define the tools
+
+- With SQL/hook toolsets you define the tools. With MCP, the agent **asks the server** what tools it has, and all of them (names, descriptions, arguments) are given to the agent.
+- So you must **trust the MCP server** you connect to - you don't know what tools it exposes unless you read its documentation.
+
+## SQL toolset vs MCP toolset (e.g. Snowflake)
+
+- Use the **SQL toolset** (+ Snowflake connection) when the job is "query my Snowflake safely and I want to control the boundary myself" - you know exactly which tables the agent can touch.
+- Use the **MCP toolset** (e.g. a Snowflake MCP server) when you specifically want its **richer tools**, not just SQL - the vendor provides extra capabilities for a richer experience.
+- Ultimately it depends on what you want to achieve.
+
+## Key takeaway
+
+- MCP lets you reuse existing tools via a standard protocol instead of reinventing the wheel. You don't define the tools (the server does), so trust and documentation matter; prefix tool names to avoid collisions; keep URL/secrets in an mcp-type Airflow connection.
+
+
+<!-- ===== 35.agent-skills.md ===== -->
+
+# Agent Skills Toolset
+
+- Every other toolset answers "**what can the agent touch?**" (query a DB, call a hook method, reach an MCP server). The agent skills toolset answers a different question: "**what does the agent know how to do?**"
+- It's about **skills / know-how** - e.g. how to write our standard sales report or apply a refund policy, not whether it can reach the orders table.
+
+## What a skill is
+
+- A **skill** is a little bundle of instructions - a folder with a markdown file (typically `skill.md`; you can have multiple).
+- A skill file has:
+  - **name** and **description** at the top - the description tells the model **when to use/load** the skill (e.g. "how to write our standard sales report; use before writing any reporting SQL").
+  - **plain markdown body** - the steps to follow, rules to apply (e.g. "always filter to the current fiscal quarter," "revenue means net revenue").
+- **Clever part:** the agent does **not** get the full text of every skill dumped into its prompt. It first sees only the **names and descriptions**, then decides if a skill is relevant and loads it on demand. Reusable know-how, discovered by description, loaded when needed.
+
+## Using the agent skills toolset
+
+- Pass it to the agent decorator's toolsets list and point it at one or more **skill sources** (e.g. a local directory). The agent then discovers and loads skills on demand.
+- Requires installing the Common AI provider with the optional **`skills`** extra, or it won't work.
+
+## Pair it with a capability toolset
+
+- The skills toolset only tells the agent **how** to do something - it does **not** give access to anything.
+- In practice, pair it with a **capability toolset** (SQL, hook, or MCP). Example: agent skills toolset provides the reporting rules (the know-how) + SQL toolset provides access to the tables (the numbers).
+- So the skills toolset is **not a replacement** for the others - it's used **alongside** them.
+
+## Skills from Git (real world)
+
+- Local folders are fine for demos, but in practice skills live in a **Git repo** the team maintains. Use `GitSkills` as the source:
+  - specify the repo, a `connection_id` (Airflow connection of type **git**, token stored there), an optional path (subfolder), and an optional branch.
+  - the repo is **cloned at runtime on the worker** (not when the DAG is parsed).
+
+## Security (important - exam-relevant)
+
+- A skill bundle isn't always just text - it can include **scripts the agent can run on your worker**. Combined with runtime fetching from a repo, anyone who can change the repo could introduce code that runs in your environment. Four safeguards:
+  1. Point the repo URL at a **repository you trust**.
+  2. **Pin the branch** to a specific reviewed reference - don't default to `main` (it can change).
+  3. If the agent only needs instructions and never needs to run scripts, **turn script execution off** via `exclude_tools=["run_skill_script"]` on the toolset (`run_skill_script` is the actual value from the underlying Python package).
+  4. Keep **credentials in the Airflow git connection**, not in URLs, and run workers without ambient git credentials if you need strict isolation.
+
+## When to use it
+
+- You have **reusable procedures** the agent should follow the same way every time (coding conventions, support policy) and you don't want to paste them into every system prompt.
+- You want **domain rules in one versioned place** (a Git repo) instead of scattered across pipelines.
+- **Not** a way to give the agent access to something - for that, use the SQL/hook/MCP toolsets.
+
+
+<!-- ===== 41.evaluation.md ===== -->
+
+# Evaluation
+
+- When you add an AI task (summarize a ticket, classify a record, draft a reply), its output flows downstream - so you must ask: **how good is this output?** Never just assume the LLM's output is good; it can impact customers and production.
+- This lesson covers three things: (1) reframe **evaluation as a task**, (2) the two judges - **LLM-as-a-judge** and **human**, (3) how to **choose** between them using five factors.
+
+## Evaluation is just another check
+
+- After a normal transformation you don't blindly trust the output - you run a **data quality check** (row count > 0, no nulls). If it fails, the task fails.
+- An AI step is just another transformation - it gets the same treatment: **check its output before anything downstream trusts it**. That check is **evaluation**.
+- What changes with AI is what "bad" looks like - not a null or negative number, but a **wrong category, made-up figure, wrong tone, malformed result**.
+  - Some you can still catch with plain assertions (valid JSON? label in the allowed set?).
+  - But the ones that matter most have **no simple assert** (there's no `assert summary is accurate`). Evaluation needs something that can make that judgment and write down a **verdict** you can act on.
+
+## Judge 1 - LLM as a judge
+
+- Use an LLM to grade another model's output: hand it the output + a checklist of what "good" means; it returns a verdict (pass/fail or per-item score) + a short reason.
+- In Airflow, implement with the LLM decorator: define a Pydantic verdict model (e.g. `pass`, `reason`), put the grading criteria in the system prompt ("score this summary: accurate, complete, on topic?"), set `output_type` to the verdict model, and pass the summary from an upstream task.
+- **Pros:** cheap, fast, scales - run it on every output, day and night.
+- **Cons:** can be **confidently wrong** and may favor outputs that just *sound* good. Great **first filter**, but don't rely on it alone for subjective or high-stakes cases.
+
+## Judge 2 - Human
+
+- In Airflow, use the **human-in-the-loop operators** (available from 3.1), e.g. the approval operator: the task pauses, a person reviews the AI output and approves/rejects, and the DAG branches accordingly.
+- **Pros:** authority and accountability (a named person owns the "yes" for compliance-weighty, customer-facing decisions); humans handle ambiguity far better than a model.
+- **Cons:** much higher cost, much slower, doesn't scale (you can't review 10,000 outputs/day yourself).
+
+## Choosing between them - five questions
+
+1. **Cost & scale** - thousands/hour -> a human can't keep up (lean LLM judge); a handful of high-value decisions/day -> a human is feasible.
+2. **Reversibility** - can you undo a wrong judgment? A mislabeled internal record is fixable (AI judge ok); an email already sent or a refund already issued is not (human should sign off).
+3. **Impact** - who's affected and how badly? Low-impact internal/routine -> LLM judge; high-impact customer-facing/money-moving -> human.
+4. **Ambiguity** - crisp, checkable criteria -> LLM judge does well; nuanced judgment call -> human.
+5. (These factors together guide the decision.)
+
+## Use both in sequence (common pattern)
+
+- Run the **LLM judge on everything cheaply**; the ones it's unsure about (low confidence or flagged high-impact) **escalate to a human**.
+- This way scarce human attention goes only where needed, and **nothing skips evaluation entirely**.
+
+## Traps to avoid (exam-relevant)
+
+- **No evaluation step** - never just trust the model; always verify its output.
+- **Letting the LLM judge make the final call on high-stakes decisions** - it's a great filter but can be confidently wrong (LLMs hallucinate). Check important ones yourself.
+- **Putting a human on everything** - humans aren't as fast as LLMs; use them only where it makes sense. Default: LLM judge as the first layer, human as the second layer for low-confidence or high-stakes cases.
+
+
+<!-- ===== 42.llm-as-a-judge.md ===== -->
+
+# LLM as a Judge (Implementation)
+
+- How to implement LLM-as-a-judge using the LLM decorator, building up from a naive version to a reliable one.
+
+## Naive version (don't do this)
+
+- Use the LLM decorator to make a task that sends one prompt and returns the model's answer. The function returns the prompt ("review the summary"), the summary comes from an upstream task, and the decorator carries the connection ID + system prompt.
+- **Problem:** it answers in **plain text**. You get an English sentence like "that looks good" or "mostly good but a bit long" - how do you know if that means pass or fail? You don't want a judge that answers in free text.
+
+## Improvement 1 - structured output
+
+- Add the **`output_type`** parameter with a Pydantic model (e.g. `Verdict`) that the model must comply with.
+- Fields: `pass`, `accurate`, `complete`, etc. as **booleans**, plus `reason` as a **string** explaining the decision.
+- This removes free text and parsing/guessing - it turns the judge "from a thing that talks into a thing that decides."
+
+## Improvement 2 - a checklist in the system prompt
+
+- Structured output isn't enough if the instructions are vague ("decide if it passes"). A judge is only as good as what you tell it to check.
+- Spell out the checklist in the **system prompt** (the stable, reused part): e.g. "You are a strict reviewer of AI-written summaries. Check three things: accurate, complete, on topic. Set pass=true only if all three hold. Always give a one-line reason."
+- **The split:** standing instructions (what to check, how strict) go in the **system prompt**; the thing that changes (the actual summary) goes in the **prompt** (returned by the function). This grades every summary the same way.
+
+## Improvement 3 - give the judge the source (for accuracy)
+
+- If you only show the judge the summary, it can only check whether it **reads well**, not whether it's **true** - a confident, fluent, completely wrong summary would pass.
+- Since accuracy is a criterion, pass **both the original source and the output being checked** (e.g. `source_text` + `summary`). Rule of thumb: whenever you evaluate accuracy, you must also pass the source.
+
+## Wiring it into the pipeline
+
+- `fetch document` (returns the source) -> `summarize` (the AI task being evaluated; returns the summary) -> `llm as a judge` (also receives the source) -> returns a **verdict** (the Pydantic model: `pass`, `accurate`, ...).
+- Downstream, a task reads the verdict: if `pass` is false, **raise AirflowException** (stop - the judge decided it's not good enough); otherwise return the draft and continue.
+
+## Key takeaway
+
+- A reliable LLM judge needs three things: a **typed verdict** (`output_type` + Pydantic), an **explicit checklist in the system prompt**, and the **source** whenever you check accuracy. Keep stable instructions in the system prompt and the changing content in the returned prompt.
+
+
+<!-- ===== 43.human-in-the-loop-operators.md ===== -->
+
+# Human-in-the-Loop Operators
+
+- Some high-stakes, irreversible decisions shouldn't be made by an LLM alone - they should go to a human. The **human-in-the-loop (HITL) operators** are how a person plugs into a running DAG.
+- When a task uses a HITL operator, the task (and the DAG) **pauses** until a person sees the AI output in the Airflow UI and makes a call. Only then does the workflow continue.
+
+## Approval operator
+
+- The simplest HITL operator: shows a person **two options - approve and reject** - and uses the answer to decide whether downstream runs.
+- Put it right before the action you want to protect (e.g. subject "Approve this refund," body "the agent proposes refunding the customer, review and decide").
+- On **approve** -> downstream tasks run normally. On **reject** -> downstream tasks are skipped.
+- You can set a `subject` and `body`.
+- **Default behavior:** a reject does **not** fail the task - the reviewer answered, the task succeeded, the answer was just "no," and downstream is skipped. "No" is a valid answer.
+- There's a **`fail_on_reject`** option (set true to make a reject fail the task), but the instructor advises against it - a reject isn't really a failure, just a decision to stop.
+
+## Human-in-the-loop operator (more than two choices)
+
+- When approve/reject isn't enough (e.g. an AI draft reply where you want "send it," "send after edits," or "discard").
+- Implementation: pass a `subject`, a `body` (often from an upstream AI task, e.g. `draft_reply`), and a **list of options** (e.g. send as is / send with edits / discard) plus a **default value** (e.g. discard).
+- When the person answers, the task hands back their decision as its result, and a downstream task reads it:
+  - `review.output` returns the XCom the operator produced.
+  - `chosen_options` -> what the person picked.
+  - `params_input` -> anything they typed in.
+  - The result also records **who responded and when** (nice for auditing).
+
+## Two extra parameters
+
+- **`multiple`** - set true to let the reviewer pick more than one option from the list.
+- **`assigned_users`** - limit who is allowed to respond (good for high-critical tasks).
+
+## Timeouts (important - exam-relevant)
+
+- A human gate waits for a human - if nobody answers and you set no limit, it **waits forever**. Always set **`response_timeout`** (e.g. 4 hours).
+- The timeout alone isn't enough - what happens when it fires depends on the **default value**:
+  - with a default set -> on timeout the task takes the default option (e.g. discard).
+  - with **no default** set -> the timeout **fails the task**.
+- Usually you want the first option (times out to the default).
+
+## Common mistakes to avoid
+
+- **No `response_timeout`** - it works like a sensor, so you waste resources waiting; always set one.
+- **Timeout without a default value** - define the default the operator should take on timeout.
+- **Gating everything** - sometimes no HITL is fine; it depends on the use case. Consider the LLM judge for lower-stakes cases, and reserve human review for critical, high-stakes decisions.
+
+
+<!-- ===== 44.give-feedback-to-agent.md ===== -->
+
+# Give Feedback to Your Agent (Branch & Entry Operators)
+
+- Two more human-in-the-loop operators beyond approval and the basic HITL operator:
+  - **HITL branch operator** - pick an option that routes to different downstream paths.
+  - **HITL entry operator** - collect actual feedback (a form) to pass back to your model for the next attempt.
+
+## HITL branch operator
+
+- Approval only lets you run or skip; the branch operator lets the human **pick among different paths**, and the DAG runs the task that option points to (skipping the rest - it's a branch task).
+- Example options the human sees: **publish** or **send back for revision**. An **`options_mapping`** says which downstream task each option runs (publish -> `publish_summary`; send back for revision -> `collect_feedback`).
+- Like other HITL operators, define a **default value** (e.g. send back for revision) and a **`response_timeout`** (e.g. 4 hours) so the default path is taken if nobody answers.
+
+### options_mapping (important - exam-relevant)
+
+- The reviewer should see **plain language** (publish, send back for revision), not internal task IDs (`collect_feedback`). The mapping is the translation layer: **option label (left) -> task ID (right)**.
+- Two rules:
+  1. Every **key** must be one of your options, or the operator rejects it at DAG parse time.
+  2. Every **value** must be a real task ID **downstream of the branch** (same as any branch).
+- If your option labels already *are* your task IDs, you can **skip the mapping** - the operator treats the chosen option as the task ID directly. Use `options_mapping` when you want human-readable labels with correct routing.
+
+## HITL entry operator
+
+- A branch tells you **which** path, but not **why**. On a reject/revision path you want the reviewer's actual input so the next attempt can fix the real problem.
+- Instead of options to click, it shows a **form to fill in** (e.g. subject "what needs to change in this summary").
+- Each field has a **name, type, and default** (via the `params` feature). The human fills it in and submits.
+- What they entered comes back in **`params_input`**, accessible from a downstream task (e.g. `params_input["feedback"]`, `params_input["severity"]`). That's how you pass feedback back to your model.
+
+## Combining them (the improvement loop)
+
+- Use the **branch operator** as the review task with different downstream paths per option. Reviewing a summary from an upstream AI task, if it's not good enough you pick **regenerate**.
+- That routes to the **entry operator**, so you don't just regenerate blindly - you pass **feedback** to the model. The next generation should be better because the model now has feedback it didn't have before.
+- Result: a complete loop that automatically improves what the model produces.
+
+## Key takeaways (exam-relevant)
+
+- Always define **`options_mapping`** (when you don't want to use task IDs directly) to keep human-readable options in the branch operator.
+- Always **read the entry operator's result via `params_input`** to capture the feedback.
